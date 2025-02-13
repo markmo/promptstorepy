@@ -86,7 +86,15 @@ class PromptStore:
         setattr(self, name, func)
         return func
 
-    def execute(self, name, args, params, content_only=False):
+    def execute(
+        self,
+        name,
+        args,
+        params,
+        history=None,
+        messages=None,
+        content_only=False,
+    ):
         self.logger.debug(
             f"execute [name={name}; args={json.dumps(args)}; params={json.dumps(params)}; contentOnly={content_only}]"
         )
@@ -95,6 +103,8 @@ class PromptStore:
             options = {
                 "args": args,
                 "params": params,
+                "history": history,
+                "messages": messages,
                 "workspaceId": self.workspace_id,
             }
             self.logger.debug(f"url: {url}, options: {options}")

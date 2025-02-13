@@ -97,7 +97,7 @@ class ApiService:
 
         try:
             logger.debug(f"url: {url} {kwargs}")
-            response = requests.request(method, url, **kwargs, timeout=5)
+            response = requests.request(method, url, **kwargs, timeout=120)
             logger.debug(f"response: {response}")
             response.raise_for_status()
             return response

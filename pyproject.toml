@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "promptstorepy"
-version = "0.1.0"
+version = "0.1.2"
 description = ""
 authors = ["Mark Moloney <markmo@me.com>"]
 readme = "README.md"
@@ -9,7 +9,6 @@ readme = "README.md"
 python = "^3.11"
 asyncio = "^3.4.3"
 requests = "^2.32.2"
-langchain-core = "^0.2.1"
 devtools = "^0.12.2"
 
 
