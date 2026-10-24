@@ -5,10 +5,14 @@ description = ""
 authors = ["Mark Moloney <markmo@me.com>"]
 readme = "README.md"
 
+# A stale backup kept in the repo; not part of the package.
+exclude = ["promptstorepy/*.bak"]
+
 [tool.poetry.dependencies]
 python = "^3.11"
 requests = "^2.32.2"
 devtools = "^0.12.2"
+pydantic = ">=1.10,<3"  # Tracing models
 
 
 [build-system]
