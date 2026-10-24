@@ -3,11 +3,40 @@ import json
 import logging
 import requests
 from devtools import debug
+from typing import Optional, Union
 from uuid import uuid4
 
 from .ApiService import ApiService
+from .CognitoAuth import CognitoAuth
+from .errors import PromptSetVersionNotFound
 from .KeycloakAuth import KeycloakAuth
 from .utils import get_search_type, strip_empty_values
+
+
+def _error_body(response) -> Optional[dict]:
+    """The JSON body of an error response when it carries ``errors``.
+
+    ``requests.Response`` is falsy for 4xx/5xx (``__bool__`` is ``ok``), so
+    test it against None, and tolerate bodies that are not JSON.
+    """
+    if response is None:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) and body.get("errors") else None
+
+
+def _error_message(response) -> Optional[str]:
+    """The first ``errors[].message`` of an error response, if it has one."""
+    try:
+        errors = response.json().get("errors") or []
+    except (ValueError, AttributeError):
+        return None
+    if errors and isinstance(errors[0], dict):
+        return errors[0].get("message")
+    return None
 
 
 class PromptStore:
@@ -21,15 +50,27 @@ class PromptStore:
             "WORKSPACE_ID", os.getenv("WORKSPACE_ID")
         )
         self.functions = {}
-        self.api_service = ApiService()
 
-        auth_method = self.constants.get("AUTH_METHOD", os.getenv("AUTH_METHOD"))
-        if auth_method and auth_method.lower() == "oauth":
+        # cognito (alias oauth): bearer tokens from the user pool the server
+        # verifies. keycloak: not supported by the server yet (see
+        # KeycloakAuth). Unset or apikey: the PROMPTSTORE_API_KEY header.
+        auth_method = (self.constants.get("AUTH_METHOD", os.getenv("AUTH_METHOD")) or "apikey").lower()
+        if auth_method in ("cognito", "oauth"):
+            self.auth = CognitoAuth(self.constants, self.logger)
+        elif auth_method == "keycloak":
             self.auth = KeycloakAuth(self.constants, self.logger)
-            token = self.auth.get_access_token()
-            self.api_service.set_token(token)
+        elif auth_method == "apikey":
+            self.auth = None
+        else:
+            raise ValueError(f"Unknown AUTH_METHOD {auth_method!r}: use cognito, keycloak or apikey")
+        if self.auth:
+            # The API service renews expired tokens through the same source.
+            self.api_service = ApiService(token_source=self.auth)
+            self.api_service.set_token(self.auth.get_access_token())
             if callable(callback):
                 callback()
+        else:
+            self.api_service = ApiService()
 
     def trace(self, event):
         debug(f"trace [event={json.dumps(event)}]")
@@ -43,8 +84,9 @@ class PromptStore:
         except requests.RequestException as err:
             debug(err)
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def add_function(self, name, params, content_only=False):
@@ -79,8 +121,9 @@ class PromptStore:
                 return data
             except requests.RequestException as err:
                 self.logger.error(str(err))
-                if err.response and err.response.json().get("errors"):
-                    return err.response.json()
+                body = _error_body(err.response)
+                if body:
+                    return body
                 return {"errors": [{"message": str(err)}]}
 
         setattr(self, name, func)
@@ -125,8 +168,9 @@ class PromptStore:
             return data
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def execute_composition(self, name, args, params, functions):
@@ -146,8 +190,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def call_tool(self, name, args, raw):
@@ -160,8 +205,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def chat_completion(self, messages, model, max_tokens, index_name):
@@ -182,8 +228,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def create_embeddings(self, embedding_provider, embedding_model, chunks):
@@ -202,8 +249,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def create_image(self, prompt, n=1, size="1024x1024"):
@@ -221,8 +269,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def generate_image_variant(self, image_url, n=1):
@@ -235,8 +284,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_functions_by_tag(self, tag):
@@ -250,8 +300,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_compositions(self):
@@ -263,8 +314,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_composition(self, composition_id):
@@ -276,26 +328,51 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
-    def get_prompt_set(self, skill: str):
-        self.logger.debug(f"getPromptSet [skill={skill}]")
+    def get_prompt_set(self, skill: str, version: Optional[Union[str, int]] = None):
+        """The prompt set for ``skill``; with ``version``, its prompts at that
+        version (a tag such as ``1.2.0``, a version number or a version id).
+
+        Without a version this returns the latest prompt set, ``None`` when
+        there is none, or an ``{"errors": [...]}`` dict on a request error.
+        With a version that the server does not have, it raises
+        :class:`PromptSetVersionNotFound` rather than fall back to latest.
+        The response's ``resolvedVersion`` says which version was rendered.
+        """
+        self.logger.debug(f"getPromptSet [skill={skill}; version={version}]")
+        params = {"skill": skill}
+        if version is not None:
+            params["version"] = str(version)
         try:
-            url = f"{self.url}/workspaces/{self.workspace_id}/prompt-sets?skill={skill}"
-            self.logger.debug(f"url: {url}")
-            res = self.api_service.get(url)
+            url = f"{self.url}/workspaces/{self.workspace_id}/prompt-sets"
+            self.logger.debug(f"url: {url} params: {params}")
+            res = self.api_service.get(url, params=params)
             pss = res.json()
             self.logger.debug(f"pss: {pss}")
             self.logger.debug(f"len: {len(pss)}")
             if len(pss) > 0:
                 return pss[0]
+            if version is not None:
+                raise PromptSetVersionNotFound(skill, version)
             return None
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            response = err.response
+            if (
+                version is not None
+                and response is not None
+                and response.status_code == 404
+            ):
+                raise PromptSetVersionNotFound(
+                    skill, version, _error_message(response)
+                ) from err
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_prompt_sets(self):
@@ -307,8 +384,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_workspace_prompt_sets(self):
@@ -320,8 +398,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_workspace_prompt_sets_by_skill(self, skill):
@@ -335,8 +414,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_indexes(self):
@@ -348,8 +428,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_index(self, vector_store_provider, index_name):
@@ -363,8 +444,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def create_index(self, vector_store_provider, index_name, schema, params):
@@ -384,8 +466,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def drop_index(self, vector_store_provider, index_name):
@@ -399,8 +482,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def add_document(self, filepath):
@@ -424,8 +508,9 @@ class PromptStore:
                 return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def index_documents(self, index_name, documents):
@@ -439,8 +524,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def drop_documents(self, index_name, query, attrs):
@@ -459,8 +545,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def index_chunks(self, vector_store_provider, chunks, embeddings, params):
@@ -475,8 +562,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def delete_chunks(self, vector_store_provider, ids, params):
@@ -495,8 +583,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def delete_chunk(self, vector_store_provider, chunk_id, params):
@@ -515,8 +604,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def search(self, params):
@@ -529,8 +619,9 @@ class PromptStore:
             return res.json()
         except requests.RequestException as err:
             self.logger.error(str(err))
-            if err.response and err.response.json().get("errors"):
-                return err.response.json()
+            body = _error_body(err.response)
+            if body:
+                return body
             return {"errors": [{"message": str(err)}]}
 
     def get_search_schema(self, schema):

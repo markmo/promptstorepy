@@ -1,24 +1,36 @@
-import asyncio
 import logging
 import os
+import threading
 import requests
-from requests.exceptions import RequestException
-from urllib.parse import urlencode
 
 logger = logging.getLogger(__name__)
 
 
 class ApiService:
-    def __init__(self):
+    """HTTP client for the PromptStore API.
+
+    Authenticates with a bearer token when one is set (``set_token``), else
+    with the ``PROMPTSTORE_API_KEY`` header. With a ``token_source``, a 401
+    renews the token once and retries the request once; a 403 is never
+    retried, since a new token will not change it.
+
+    A token source (``CognitoAuth``; ``KeycloakAuth`` for later) has
+    ``get_access_token() -> token`` and ``refresh(token) -> token``, where a
+    token is a dict whose ``access_token`` is the bearer to send and whose
+    optional ``refresh_token`` renews it.
+    """
+
+    def __init__(self, token_source=None):
         self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        self.is_token_refreshing = False
-        self.failed_queue = []
+        self.token_source = token_source
         self.state = None
         self.on_refresh_callback = None
         self.on_expiry_callback = None
+        # Serializes renewal so threads that hit a 401 together refresh once.
+        self._refresh_lock = threading.Lock()
 
     def set_token(self, token):
         self.state = token
@@ -37,105 +49,58 @@ class ApiService:
     def get_refresh_token(self):
         return self.state.get("refresh_token") if self.state else None
 
-    async def renew_token(self):
-        refresh_token = self.get_refresh_token()
-        token = await self.get_new_token(refresh_token)
-        self.set_token(token)
+    def renew_token(self):
+        """Replace the current token: refresh grant if there is a refresh
+        token, else (or if it is rejected) a fresh token from the source."""
+        if self.token_source is None:
+            raise RuntimeError("no token source configured to renew the access token")
+        if self.get_refresh_token():
+            try:
+                self.set_token(self.token_source.refresh(self.state))
+                return
+            except requests.RequestException as err:
+                logger.warning(f"token refresh failed, requesting a new token: {err}")
+        self.set_token(self.token_source.get_access_token())
 
-    async def get_new_token(self, refresh_token):
-        host = os.getenv("KEYCLOAK_HOST")
-        realm = os.getenv("KEYCLOAK_REALM")
-        url = f"{host}/realms/{realm}/protocol/openid-connect/token"
-        client_id = os.getenv("KEYCLOAK_CLIENT_ID")
-        client_secret = os.getenv("KEYCLOAK_CLIENT_SECRET")
-        grant_type = "refresh_token"
-
-        data = {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "grant_type": grant_type,
-            "refresh_token": refresh_token,
-        }
-
-        try:
-            response = requests.post(
-                url,
-                data=urlencode(data),
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-            )
-            response.raise_for_status()
-            res_data = response.json()
-            return {
-                "accessToken": res_data["access_token"],
-                "refreshToken": res_data["refresh_token"],
-            }
-        except RequestException as err:
-            message = f"Error getting new token: {err}"
-            print(message)
-            raise Exception(message)
-
-    async def process_queue(self, error, access_token=None):
-        for prom in self.failed_queue:
-            if error:
-                prom["reject"](error)
-            else:
-                prom["resolve"](access_token)
-        self.failed_queue = []
-
-    def request(self, method, url, **kwargs):
+    def _send(self, method, url, kwargs):
         access_token = self.get_access_token()
-        headers = kwargs.pop("headers", {})
+        headers = dict(kwargs.get("headers") or {})
         if access_token:
             headers["Authorization"] = f"Bearer {access_token}"
         else:
             headers["apikey"] = os.getenv("PROMPTSTORE_API_KEY")
-
         headers.update(self.headers)
-        kwargs["headers"] = headers
+        logger.debug(f"url: {url} {kwargs}")
+        response = requests.request(method, url, **{**kwargs, "headers": headers})
+        logger.debug(f"response: {response}")
+        return response, access_token
 
-        try:
-            logger.debug(f"url: {url} {kwargs}")
-            response = requests.request(method, url, **kwargs, timeout=120)
-            logger.debug(f"response: {response}")
-            response.raise_for_status()
-            return response
-        except RequestException as err:
-            logger.error(err)
-            if err.response and err.response.status_code in [401, 403]:
-                return self.handle_token_refresh(err, method, url, **kwargs)
-            else:
-                raise
+    def _renew_after_401(self, stale_token, response):
+        with self._refresh_lock:
+            if self.get_access_token() != stale_token:
+                return  # another thread renewed it while this one waited
+            try:
+                self.renew_token()
+            except Exception as err:
+                if callable(self.on_expiry_callback):
+                    self.on_expiry_callback(err)
+                # Keep it a RequestException so callers' handlers still see
+                # the original 401 response.
+                raise requests.HTTPError(
+                    f"401 Unauthorized for url: {response.url}; token renewal failed: {err}",
+                    response=response,
+                ) from err
 
-    def handle_token_refresh(self, err, method, url, **kwargs):
-        if self.is_token_refreshing:
-            future = asyncio.Future()
-            self.failed_queue.append(
-                {"resolve": future.set_result, "reject": future.set_exception}
-            )
-            access_token = asyncio.run(future)
-            kwargs["headers"]["Authorization"] = f"Bearer {access_token}"
-            return self.request(method, url, **kwargs)
-
-        self.is_token_refreshing = True
-        original_request = err.request
-
-        try:
-            refresh_token = self.get_refresh_token()
-            token = asyncio.run(self.get_new_token(refresh_token))
-            self.set_token(token)
-            kwargs["headers"]["Authorization"] = f'Bearer {token["accessToken"]}'
-            response = self.request(method, url, **kwargs)
-            self.process_queue(None, token["accessToken"])
-            return response
-        except Exception as err:
-            self.process_queue(err)
-            if callable(self.on_expiry_callback):
-                self.on_expiry_callback(err)
-            raise
-        finally:
-            self.is_token_refreshing = False
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault("timeout", 120)
+        response, used_token = self._send(method, url, kwargs)
+        if response.status_code == 401 and used_token and self.token_source is not None:
+            self._renew_after_401(used_token, response)
+            response, _ = self._send(method, url, kwargs)
+        if not response.ok:
+            logger.error(f"{method} {url}: {response.status_code}")
+        response.raise_for_status()
+        return response
 
     def get(self, url, **kwargs):
         return self.request("GET", url, **kwargs)
